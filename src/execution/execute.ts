@@ -115,6 +115,14 @@ export interface ExecutionContext {
   typeResolver: GraphQLTypeResolver<any, any>;
   subscribeFieldResolver: GraphQLFieldResolver<any, any>;
   errors: Array<GraphQLError>;
+  /**
+   * Response positions that were replaced with `null` because a field error
+   * propagated to them, with `undefined` standing in for the root position
+   * (i.e. the whole `data` was replaced with `null`). Errors raised later
+   * for such a position, or for any position within it, are no longer
+   * recorded, since that position no longer exists in the response.
+   */
+  nulledPaths: Set<Path | undefined>;
 }
 
 /**
@@ -204,6 +212,9 @@ export function execute(args: ExecutionArgs): PromiseOrValue<ExecutionResult> {
         (data) => buildResponse(data, exeContext.errors),
         (error) => {
           exeContext.errors.push(error);
+          // The whole response was replaced with `null`, so errors raised
+          // by fields that are still in flight are no longer recorded.
+          exeContext.nulledPaths.add(undefined);
           return buildResponse(null, exeContext.errors);
         },
       );
@@ -211,6 +222,7 @@ export function execute(args: ExecutionArgs): PromiseOrValue<ExecutionResult> {
     return buildResponse(result, exeContext.errors);
   } catch (error) {
     exeContext.errors.push(error);
+    exeContext.nulledPaths.add(undefined);
     return buildResponse(null, exeContext.errors);
   }
 }
@@ -239,7 +251,9 @@ function buildResponse(
   data: ObjMap<unknown> | null,
   errors: ReadonlyArray<GraphQLError>,
 ): ExecutionResult {
-  return errors.length === 0 ? { data } : { errors, data };
+  // The errors are copied so that the returned result is guaranteed to not
+  // change anymore once it has been handed to the caller.
+  return errors.length === 0 ? { data } : { errors: [...errors], data };
 }
 
 /**
@@ -321,7 +335,7 @@ export function buildExecutionContext(
     return [new GraphQLError('Must provide an operation.')];
   }
 
-  // FIXME: 
+  // FIXME:
   /* c8 ignore next */
   const variableDefinitions = operation.variableDefinitions ?? [];
 
@@ -347,6 +361,7 @@ export function buildExecutionContext(
     typeResolver: typeResolver ?? defaultTypeResolver,
     subscribeFieldResolver: subscribeFieldResolver ?? defaultFieldResolver,
     errors: [],
+    nulledPaths: new Set(),
   };
 }
 
@@ -542,13 +557,13 @@ function executeField(
       // to take a second callback for the error case.
       return completed.then(undefined, (rawError) => {
         const error = locatedError(rawError, fieldNodes, pathToArray(path));
-        return handleFieldError(error, returnType, exeContext);
+        return handleFieldError(error, returnType, exeContext, path);
       });
     }
     return completed;
   } catch (rawError) {
     const error = locatedError(rawError, fieldNodes, pathToArray(path));
-    return handleFieldError(error, returnType, exeContext);
+    return handleFieldError(error, returnType, exeContext, path);
   }
 }
 
@@ -582,6 +597,7 @@ function handleFieldError(
   error: GraphQLError,
   returnType: GraphQLOutputType,
   exeContext: ExecutionContext,
+  path: Path,
 ): null {
   // If the field type is non-nullable, then it is resolved without any
   // protection from errors, however it still properly locates the error.
@@ -590,9 +606,37 @@ function handleFieldError(
   }
 
   // Otherwise, error protection is applied, logging the error and resolving
-  // a null value for this field if one is encountered.
-  exeContext.errors.push(error);
+  // a null value for this field if one is encountered. However, if the
+  // response position for this field was already replaced with `null`
+  // because a previously reported error propagated to one of its ancestors,
+  // then the error is no longer logged, since that position does not exist
+  // in the response anymore.
+  if (!isNulledResponsePosition(exeContext, path)) {
+    exeContext.errors.push(error);
+  }
+  exeContext.nulledPaths.add(path);
   return null;
+}
+
+/**
+ * Checks if the response position for the given path was already replaced
+ * with `null`, either directly or because an ancestor position was nulled
+ * as a result of error propagation.
+ */
+function isNulledResponsePosition(
+  exeContext: ExecutionContext,
+  path: Path,
+): boolean {
+  const { nulledPaths } = exeContext;
+  let currentPath: Path | undefined = path;
+  while (currentPath !== undefined) {
+    if (nulledPaths.has(currentPath)) {
+      return true;
+    }
+    currentPath = currentPath.prev;
+  }
+  // The nulled root position is tracked as `undefined`.
+  return nulledPaths.has(undefined);
 }
 
 /**
@@ -763,13 +807,13 @@ function completeListValue(
             fieldNodes,
             pathToArray(itemPath),
           );
-          return handleFieldError(error, itemType, exeContext);
+          return handleFieldError(error, itemType, exeContext, itemPath);
         });
       }
       return completedItem;
     } catch (rawError) {
       const error = locatedError(rawError, fieldNodes, pathToArray(itemPath));
-      return handleFieldError(error, itemType, exeContext);
+      return handleFieldError(error, itemType, exeContext, itemPath);
     }
   });
 
