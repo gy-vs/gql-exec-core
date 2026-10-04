@@ -115,6 +115,16 @@ export interface ExecutionContext {
   typeResolver: GraphQLTypeResolver<any, any>;
   subscribeFieldResolver: GraphQLFieldResolver<any, any>;
   errors: Array<GraphQLError>;
+  /**
+   * Response paths of positions that were replaced with `null` because of an
+   * error propagating through a Non-Null type (the empty path stands for the
+   * whole response being nulled).
+   *
+   * Once a position is nulled, errors for that position or its descendants
+   * are no longer reported, as required by the "Error Handling" section of
+   * the GraphQL specification.
+   */
+  nulledPaths: Array<ReadonlyArray<string | number>>;
 }
 
 /**
@@ -203,7 +213,12 @@ export function execute(args: ExecutionArgs): PromiseOrValue<ExecutionResult> {
       return result.then(
         (data) => buildResponse(data, exeContext.errors),
         (error) => {
+          // An error propagated all the way up through Non-Null fields, so the
+          // whole response is nulled. Record the error first and only then
+          // mark the root as nulled, so that this error is still reported
+          // while any later error from a sibling subtree is suppressed.
           exeContext.errors.push(error);
+          exeContext.nulledPaths.push([]);
           return buildResponse(null, exeContext.errors);
         },
       );
@@ -211,6 +226,7 @@ export function execute(args: ExecutionArgs): PromiseOrValue<ExecutionResult> {
     return buildResponse(result, exeContext.errors);
   } catch (error) {
     exeContext.errors.push(error);
+    exeContext.nulledPaths.push([]);
     return buildResponse(null, exeContext.errors);
   }
 }
@@ -234,12 +250,16 @@ export function executeSync(args: ExecutionArgs): ExecutionResult {
 /**
  * Given a completed execution context and data, build the `{ errors, data }`
  * response defined by the "Response" section of the GraphQL specification.
+ *
+ * The errors are copied into a new array so that the returned response is not
+ * mutated if asynchronous field completion elsewhere appends errors after the
+ * response has been built.
  */
 function buildResponse(
   data: ObjMap<unknown> | null,
   errors: ReadonlyArray<GraphQLError>,
 ): ExecutionResult {
-  return errors.length === 0 ? { data } : { errors, data };
+  return errors.length === 0 ? { data } : { errors: Array.from(errors), data };
 }
 
 /**
@@ -347,6 +367,7 @@ export function buildExecutionContext(
     typeResolver: typeResolver ?? defaultTypeResolver,
     subscribeFieldResolver: subscribeFieldResolver ?? defaultFieldResolver,
     errors: [],
+    nulledPaths: [],
   };
 }
 
@@ -541,14 +562,16 @@ function executeField(
       // Note: we don't rely on a `catch` method, but we do expect "thenable"
       // to take a second callback for the error case.
       return completed.then(undefined, (rawError) => {
-        const error = locatedError(rawError, fieldNodes, pathToArray(path));
-        return handleFieldError(error, returnType, exeContext);
+        const pathEntries = pathToArray(path);
+        const error = locatedError(rawError, fieldNodes, pathEntries);
+        return handleFieldError(error, returnType, exeContext, pathEntries);
       });
     }
     return completed;
   } catch (rawError) {
-    const error = locatedError(rawError, fieldNodes, pathToArray(path));
-    return handleFieldError(error, returnType, exeContext);
+    const pathEntries = pathToArray(path);
+    const error = locatedError(rawError, fieldNodes, pathEntries);
+    return handleFieldError(error, returnType, exeContext, pathEntries);
   }
 }
 
@@ -582,6 +605,7 @@ function handleFieldError(
   error: GraphQLError,
   returnType: GraphQLOutputType,
   exeContext: ExecutionContext,
+  path: ReadonlyArray<string | number>,
 ): null {
   // If the field type is non-nullable, then it is resolved without any
   // protection from errors, however it still properly locates the error.
@@ -591,8 +615,52 @@ function handleFieldError(
 
   // Otherwise, error protection is applied, logging the error and resolving
   // a null value for this field if one is encountered.
-  exeContext.errors.push(error);
+  logFieldError(exeContext, error, path);
+  // This field resolves to null; suppress later errors from its subtree.
+  exeContext.nulledPaths.push(path);
   return null;
+}
+
+/**
+ * Records `error` for `path` unless the position at `path` (or an ancestor of
+ * it) has already been replaced with `null` due to an earlier non-null
+ * violation.
+ *
+ * Per the "Error Handling" section of the GraphQL specification, once a
+ * response position has been nulled, no further errors must be recorded for
+ * that position or any of its descendants: such errors cannot affect the
+ * response delivered to the client.
+ */
+function logFieldError(
+  exeContext: ExecutionContext,
+  error: GraphQLError,
+  path: ReadonlyArray<string | number>,
+): void {
+  for (const nulledPath of exeContext.nulledPaths) {
+    if (isSubPath(nulledPath, path)) {
+      return;
+    }
+  }
+  exeContext.errors.push(error);
+}
+
+/**
+ * Returns true if `path` is equal to `prefix` or lies below it in the response
+ * tree.
+ */
+function isSubPath(
+  prefix: ReadonlyArray<string | number>,
+  path: ReadonlyArray<string | number>,
+): boolean {
+  if (prefix.length > path.length) {
+    return false;
+  }
+  for (let i = 0; i < prefix.length; i++) {
+    if (prefix[i] !== path[i]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -758,18 +826,16 @@ function completeListValue(
         // Note: we don't rely on a `catch` method, but we do expect "thenable"
         // to take a second callback for the error case.
         return completedItem.then(undefined, (rawError) => {
-          const error = locatedError(
-            rawError,
-            fieldNodes,
-            pathToArray(itemPath),
-          );
-          return handleFieldError(error, itemType, exeContext);
+          const pathEntries = pathToArray(itemPath);
+          const error = locatedError(rawError, fieldNodes, pathEntries);
+          return handleFieldError(error, itemType, exeContext, pathEntries);
         });
       }
       return completedItem;
     } catch (rawError) {
-      const error = locatedError(rawError, fieldNodes, pathToArray(itemPath));
-      return handleFieldError(error, itemType, exeContext);
+      const pathEntries = pathToArray(itemPath);
+      const error = locatedError(rawError, fieldNodes, pathEntries);
+      return handleFieldError(error, itemType, exeContext, pathEntries);
     }
   });
 
